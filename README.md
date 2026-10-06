@@ -27,22 +27,24 @@
 1. **Установите Python 3.10+** — [python.org/downloads](https://www.python.org/downloads/)
 
 2. **Установите зависимости:**
-pip install -r requirements.txt
+`pip install -r requirements.txtь`
 
 3. **Получите токен бота** у [@BotFather](https://t.me/BotFather) в Telegram.
 
 4. **Получите бесплатный ключ Gemini** на [aistudio.google.com/apikey](https://aistudio.google.com/apikey).
 
 5. **Создайте `.env`** — скопируйте `.env.example` и переименуйте копию в `.env`, затем впишите ключи:
-BOT_TOKEN=ваш_токен_от_BotFather
-GEMINI_API_KEY=ваш_ключ_Gemini
+`BOT_TOKEN=ваш_токен_от_BotFather`
+`GEMINI_API_KEY=ваш_ключ_Gemini`
+
 
 6. **Запустите бота:**
-python bot.py
+`python bot.py`
 
 7. Откройте своего бота в Telegram и отправьте `/start`.
 
 ## Структура проекта
+```
 .
 ├── bot.py # точка входа, хендлеры, логика ответа
 ├── config.py # настройки (читаются из .env)
@@ -51,6 +53,7 @@ python bot.py
 ├── requirements.txt # зависимости
 ├── .env.example # шаблон для ключей
 └── README.md
+```
 
 ## Настройка
 
