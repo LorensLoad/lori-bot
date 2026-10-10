@@ -1,25 +1,30 @@
 """
 bot.py — точка входа Telegram-бота Lori.
-
 Запуск: python bot.py
-
-Настройки (токен, ключ Gemini, модель, часовой пояс) — в файле .env.
-Характер и тексты — в prompts.py.
-Списки стоп-слов — в bad_words.py.
 """
+import re
 import asyncio
 import logging
+import os
 from datetime import datetime, timezone, timedelta
-
+from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command, Filter
 from aiogram.types import Message
-from google import genai
+from openai import OpenAI
+from dotenv import load_dotenv
+from aiogram import F
+import html
 
+from database import (
+    init_db, save_message, get_history,
+    clear_history, get_facts,
+)
 from config import (
-    BOT_TOKEN, GEMINI_API_KEY, GEMINI_MODEL,
+    BOT_TOKEN, GROQ_API_KEY, GROQ_MODEL,
     TIMEZONE_OFFSET, TIMEZONE_NAME, check_settings,
 )
+
 from prompts import SYSTEM_PROMPT, TEXTS
 from bad_words import BAD_WORDS, FORBIDDEN_TOPICS
 
@@ -29,20 +34,62 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(message)s",
 )
 log = logging.getLogger("lori")
-logging.getLogger("google_genai").setLevel(logging.WARNING)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
-# ─── Проверка ключей (если пусто — остановит бота) ───
+# ─── Проверка ключей ───
 check_settings()
 
-# ─── Клиент Gemini и Telegram ───
-client = genai.Client(api_key=GEMINI_API_KEY)
+# ─── Клиент Groq (OpenAI-совместимый) ───
+client = OpenAI(
+    base_url="https://api.groq.com/openai/v1",
+    api_key=GROQ_API_KEY,
+)
+
+# ─── Telegram ───
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-chats = {}  # {user_id: chat-объект Gemini}
 TG_MAX_LENGTH = 4096
 
+def markdown_to_html(text: str) -> str:
+    """Преобразует markdown от Lori в безопасный HTML для Telegram."""
+
+    # 1. Сначала вытаскиваем блоки кода ```lang ... ```
+    code_blocks = []
+    def save_code_block(match):
+        lang = match.group(1) or ""
+        code = match.group(2)
+        # Экранируем < > & внутри кода
+        code_safe = html.escape(code)
+        placeholder = f"___CODE_BLOCK_{len(code_blocks)}___"
+        code_blocks.append(
+            f'<pre><code class="language-{lang}">{code_safe}</code></pre>'
+        )
+        return placeholder
+
+    text = re.sub(
+        r"```(\w+)?\n(.*?)```",
+        save_code_block,
+        text,
+        flags=re.DOTALL,
+    )
+
+    # 2. Инлайн-код `code`
+    def save_inline_code(match):
+        code = match.group(1)
+        return f"<code>{html.escape(code)}</code>"
+
+    text = re.sub(r"`([^`]+)`", save_inline_code, text)
+
+    # 3. Жирный и курсив
+    text = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", text)
+    text = re.sub(r"(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)", r"<i>\1</i>", text)
+
+    # 4. Возвращаем блоки кода обратно
+    for i, block in enumerate(code_blocks):
+        text = text.replace(f"___CODE_BLOCK_{i}___", block)
+
+    return text
 
 # ═══════════════════════════════════════════════════════
 #  ФИЛЬТР ЗАПРЕЩЁННОГО КОНТЕНТА
@@ -51,7 +98,7 @@ class BadContentFilter(Filter):
     """Пропускает сообщение, если в нём нет запрещённых слов и тем."""
     async def __call__(self, message: Message) -> bool:
         if not message.text:
-            return True  # не текст — пропускаем, обработается отдельно
+            return True
 
         text = message.text.lower()
 
@@ -65,16 +112,6 @@ class BadContentFilter(Filter):
 # ═══════════════════════════════════════════════════════
 #  ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
 # ═══════════════════════════════════════════════════════
-def get_chat(user_id: int):
-    """Возвращает чат пользователя, создаёт при первом обращении."""
-    if user_id not in chats:
-        chats[user_id] = client.chats.create(
-            model=GEMINI_MODEL,
-            config={"system_instruction": SYSTEM_PROMPT},
-        )
-    return chats[user_id]
-
-
 def _now_local() -> datetime:
     """Текущее время с учётом часового пояса из .env."""
     return datetime.now(timezone.utc) + timedelta(hours=TIMEZONE_OFFSET)
@@ -93,13 +130,13 @@ def time_greeting() -> str:
 
 
 def current_time_string() -> str:
-    """Строка с текущим временем, которая подмешивается к сообщению пользователя."""
+    """Строка с текущим временем."""
     now = _now_local()
     return now.strftime(f"%d.%m.%Y, %H:%M ({TIMEZONE_NAME}, UTC+{TIMEZONE_OFFSET})")
 
 
 async def send_long_message(message: types.Message, text: str):
-    """Отправляет длинный текст с разбивкой. При битом HTML — отправляет как обычный."""
+    """Отправляет длинный текст с разбивкой. При битом HTML — как обычный."""
     async def safe_send(txt: str):
         try:
             await message.answer(txt, parse_mode="HTML")
@@ -135,13 +172,13 @@ async def send_long_message(message: types.Message, text: str):
 # ═══════════════════════════════════════════════════════
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
-    chats.pop(message.from_user.id, None)  # сброс истории
     await message.answer(
         TEXTS["start"].format(
             greeting=time_greeting(),
             name=message.from_user.first_name,
         ),
         parse_mode="HTML",
+        reply_markup=main_keyboard(),   # ← добавляем кнопки
     )
 
 
@@ -152,9 +189,15 @@ async def cmd_help(message: types.Message):
 
 @dp.message(Command("clear"))
 async def cmd_clear(message: types.Message):
-    chats.pop(message.from_user.id, None)
-    await message.answer(TEXTS["cleared"])
+    user_id = message.from_user.id
+    await clear_history(user_id)
+    await message.answer("🧹 История диалога очищена. Начнём с чистого листа.")
 
+def markdown_to_html(text: str) -> str:
+    """Меняет **жирный** и *курсив* на HTML-теги."""
+    text = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", text)
+    text = re.sub(r"(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)", r"<i>\1</i>", text)
+    return text
 
 # ═══════════════════════════════════════════════════════
 #  ОТВЕТ НА ЗАПРЕЩЁННЫЙ КОНТЕНТ
@@ -166,51 +209,87 @@ async def handle_bad_content(message: types.Message):
         "Пожалуйста, воздержитесь от нецензурной лексики и запрещённых тем."
     )
 
+@dp.message(F.text == "🧹 Очистить историю")
+async def btn_clear(message: types.Message):
+    user_id = message.from_user.id
+    await clear_history(user_id)
+    await message.answer("🧹 История диалога очищена. Начнём с чистого листа.")
 
+
+@dp.message(F.text == "❓ Помощь")
+async def btn_help(message: types.Message):
+    await message.answer(TEXTS["help"], parse_mode="HTML")
 # ═══════════════════════════════════════════════════════
 #  ОСНОВНОЙ ОБРАБОТЧИК
 # ═══════════════════════════════════════════════════════
 @dp.message(BadContentFilter())
 async def chat_with_ai(message: types.Message):
-    log.info("msg from %s: %s", message.from_user.id, message.text)
-
     if message.text is None:
-        await message.answer(TEXTS["only_text"])
+        await message.answer("Я понимаю только текст 🙂")
         return
 
     user_id = message.from_user.id
     user_text = message.text
 
-    # Фоновая задача «печатает...», пока думает Gemini
+    print(f"[{user_id}] {message.from_user.first_name}: {user_text}")
+
+    await save_message(user_id, "user", user_text)
+
+    # Фоновая задача «печатает...»
     async def keep_typing():
-        try:
-            while True:
-                await bot.send_chat_action(message.chat.id, "typing")
-                await asyncio.sleep(4)
-        except asyncio.CancelledError:
-            pass
+        while True:
+            await bot.send_chat_action(message.chat.id, "typing")
+            await asyncio.sleep(4)
 
     typing_task = asyncio.create_task(keep_typing())
 
     try:
-        chat = get_chat(user_id)
-        message_for_ai = f"[Сейчас {current_time_string()}]\n\n{user_text}"
-        response = chat.send_message(message_for_ai)
-        answer = response.text or TEXTS["empty"]
+        # История и факты из базы
+        history = await get_history(user_id, limit=20)
+        facts = await get_facts(user_id)
+        now_str = current_time_string()
+
+        history_text = "\n".join(
+            f"{'Пользователь' if role == 'user' else 'Lori'}: {content}"
+            for role, content in history[:-1]
+        )
+
+        system_prompt = (
+            f"{SYSTEM_PROMPT}\n\n"
+            f"[Сейчас {now_str}]\n"
+            f"[Что ты знаешь о пользователе: {facts or 'пока ничего'}]\n"
+            f"[История диалога:]\n{history_text}"
+        )
+
+        # Запрос к Groq
+        response = client.chat.completions.create(
+            model=GROQ_MODEL,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_text},
+            ],
+        )
+        answer = response.choices[0].message.content
+        answer = markdown_to_html(answer)
+
+        await save_message(user_id, "assistant", answer)
         await send_long_message(message, answer)
 
     except Exception as e:
         error_text = str(e)
 
-        if "429" in error_text or "RESOURCE_EXHAUSTED" in error_text:
-            await message.answer(TEXTS["rate_limit"])
-        elif "SAFETY" in error_text or "blocked" in error_text.lower():
-            await message.answer(TEXTS["safety"])
-        elif "Connection" in error_text or "timeout" in error_text.lower():
-            await message.answer(TEXTS["connection"])
+        if "429" in error_text or "rate_limit" in error_text.lower():
+            await message.answer(
+                "Прошу прощения, сэр. Я исчерпала дневной лимит запросов. "
+                "Вернусь в строй, как только Groq обновит квоту."
+            )
+        elif "401" in error_text or "unauthorized" in error_text.lower():
+            await message.answer(
+                "Прошу прощения, сэр. Похоже, проблема с моим ключом доступа. "
+                "Пожалуйста, проверьте настройки."
+            )
         else:
-            log.exception("Неизвестная ошибка")
-            await message.answer(TEXTS["unknown_error"])
+            await message.answer(f"Прошу прощения, произошла ошибка: {e}")
 
     finally:
         typing_task.cancel()
@@ -220,7 +299,10 @@ async def chat_with_ai(message: types.Message):
 #  ЗАПУСК
 # ═══════════════════════════════════════════════════════
 async def main():
-    log.info("Бот Lori запущен")
+    await init_db()
+    print("База данных готова.")
+    print("Бот Lori запущен...")
+    print("─" * 50)
     await dp.start_polling(bot)
 
 

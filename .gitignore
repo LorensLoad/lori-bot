@@ -7,3 +7,5 @@ __pycache__/
 .gigacode_vsc/
 .idea/
 .vscode/
+lori.db
+*.db
